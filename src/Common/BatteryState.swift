@@ -31,6 +31,7 @@ public struct BatterySnapshot: Codable, Sendable {
     public var percentage: Int
     public var isCharging: Bool
     public var isACConnected: Bool
+    public var isPhysicalAdapterAttached: Bool
     public var isChargeInhibited: Bool
     public var isPowerAdapterDisabled: Bool
     public var currentCapacity: Int
@@ -51,6 +52,7 @@ public struct BatterySnapshot: Codable, Sendable {
         percentage: Int = 100,
         isCharging: Bool = false,
         isACConnected: Bool = true,
+        isPhysicalAdapterAttached: Bool = true,
         isChargeInhibited: Bool = false,
         isPowerAdapterDisabled: Bool = false,
         currentCapacity: Int = 0,
@@ -70,6 +72,7 @@ public struct BatterySnapshot: Codable, Sendable {
         self.percentage = percentage
         self.isCharging = isCharging
         self.isACConnected = isACConnected
+        self.isPhysicalAdapterAttached = isPhysicalAdapterAttached
         self.isChargeInhibited = isChargeInhibited
         self.isPowerAdapterDisabled = isPowerAdapterDisabled
         self.currentCapacity = currentCapacity

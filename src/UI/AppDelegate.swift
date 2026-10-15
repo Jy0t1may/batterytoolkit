@@ -8,9 +8,12 @@ import Foundation
 
 @main
 final class AppDelegate: NSObject, NSApplicationDelegate {
+    private static var instance: AppDelegate?
+
     static func main() {
         let app = NSApplication.shared
         let delegate = AppDelegate()
+        self.instance = delegate
         app.delegate = delegate
         app.run()
     }

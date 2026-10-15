@@ -18,9 +18,11 @@ echo "=========================================================="
 echo "--> Compiling batterytoolkit-cli..."
 swiftc -target "$SWIFT_TARGET" \
     -module-cache-path "$CACHE_PATH" \
-    -framework Foundation -framework IOKit \
+    -framework Foundation -framework IOKit -framework ServiceManagement \
     "$DIR/src/Common/BatteryState.swift" \
+    "$DIR/src/Common/PowerUIClient.swift" \
     "$DIR/src/Common/SMCProtocols.swift" \
+    "$DIR/src/Helper/HelperManager.swift" \
     "$DIR/src/SMC/SMCKeys.swift" \
     "$DIR/src/SMC/SMCKit.swift" \
     "$DIR/src/Core/SleepManager.swift" \
@@ -33,9 +35,11 @@ swiftc -target "$SWIFT_TARGET" \
 echo "--> Compiling batterytoolkit-helper..."
 swiftc -target "$SWIFT_TARGET" \
     -module-cache-path "$CACHE_PATH" \
-    -framework Foundation -framework IOKit \
+    -framework Foundation -framework IOKit -framework ServiceManagement \
     "$DIR/src/Common/BatteryState.swift" \
+    "$DIR/src/Common/PowerUIClient.swift" \
     "$DIR/src/Common/SMCProtocols.swift" \
+    "$DIR/src/Helper/HelperManager.swift" \
     "$DIR/src/SMC/SMCKeys.swift" \
     "$DIR/src/SMC/SMCKit.swift" \
     "$DIR/src/Helper/BatteryHelper.swift" \
@@ -51,9 +55,11 @@ mkdir -p "$APP_DIR/Contents/Library/LaunchServices"
 
 swiftc -target "$SWIFT_TARGET" \
     -module-cache-path "$CACHE_PATH" \
-    -framework AppKit -framework SwiftUI -framework Foundation -framework IOKit \
+    -framework AppKit -framework SwiftUI -framework Foundation -framework IOKit -framework ServiceManagement \
     "$DIR/src/Common/BatteryState.swift" \
+    "$DIR/src/Common/PowerUIClient.swift" \
     "$DIR/src/Common/SMCProtocols.swift" \
+    "$DIR/src/Helper/HelperManager.swift" \
     "$DIR/src/SMC/SMCKeys.swift" \
     "$DIR/src/SMC/SMCKit.swift" \
     "$DIR/src/Core/SleepManager.swift" \

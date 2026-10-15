@@ -123,6 +123,27 @@ public final class PowerMonitor: @unchecked Sendable {
             var props: Unmanaged<CFMutableDictionary>?
             let kr = IORegistryEntryCreateCFProperties(smartBatteryService, &props, kCFAllocatorDefault, 0)
             if kr == KERN_SUCCESS, let dict = props?.takeRetainedValue() as? [String: Any] {
+                // Physical Adapter Connection
+                if let rawExt = dict["AppleRawExternalConnected"] as? Bool {
+                    snapshot.isPhysicalAdapterAttached = rawExt
+                } else if let ext = dict["ExternalConnected"] as? Bool {
+                    snapshot.isPhysicalAdapterAttached = ext
+                } else {
+                    snapshot.isPhysicalAdapterAttached = snapshot.isACConnected
+                }
+
+                // Hardware NotCharging Reason
+                if let notChargingReason = dict["NotChargingReason"] as? Int, notChargingReason != 0 {
+                    snapshot.isChargeInhibited = true
+                }
+
+                // Hardware IsCharging Flag
+                if let hwCharging = dict["IsCharging"] as? Bool {
+                    snapshot.isCharging = hwCharging
+                } else if let hwChargingInt = dict["IsCharging"] as? Int {
+                    snapshot.isCharging = (hwChargingInt != 0)
+                }
+
                 // Exact hardware cycle count
                 if let cycles = dict["CycleCount"] as? Int {
                     snapshot.cycleCount = cycles
@@ -133,9 +154,15 @@ public final class PowerMonitor: @unchecked Sendable {
                     snapshot.voltage = Double(rawVolt) / 1000.0
                 }
 
-                // Amperage (mA)
+                // Amperage (mA) - Handle 64-bit signed two's complement conversion
                 if let rawAmp = (dict["Amperage"] ?? dict["InstantAmperage"]) as? Int {
-                    snapshot.amperage = rawAmp
+                    if rawAmp > 0x7FFFFFFF {
+                        snapshot.amperage = Int(Int32(truncatingIfNeeded: rawAmp))
+                    } else if rawAmp > 0x7FFF && rawAmp < 0x10000 {
+                        snapshot.amperage = Int(Int16(truncatingIfNeeded: rawAmp))
+                    } else {
+                        snapshot.amperage = rawAmp
+                    }
                 }
 
                 // Temperature
@@ -161,21 +188,31 @@ public final class PowerMonitor: @unchecked Sendable {
         }
 
         // 3. SMC State and Dynamic Key Description
-        snapshot.isChargeInhibited = SMCKit.shared.isChargingInhibited()
+        let smcInhibit = SMCKit.shared.isChargingInhibited()
+        snapshot.isChargeInhibited = snapshot.isChargeInhibited || smcInhibit
         snapshot.isPowerAdapterDisabled = SMCKit.shared.isPowerAdapterDisabled()
 
-        if let key = SMCKit.shared.activeChargeKey {
+        if PowerUIClient.shared.isSupported {
+            snapshot.activeSMCKey = "PowerUI MCL (macOS 27 Native)"
+            if PowerUIClient.shared.getStatus().enabled {
+                snapshot.isChargeInhibited = true
+            }
+        } else if let key = SMCKit.shared.activeChargeKey {
             snapshot.activeSMCKey = "\(key.name) (Active)"
         } else {
             #if arch(arm64)
-            snapshot.activeSMCKey = "Apple Silicon CH0B (Active)"
+            snapshot.activeSMCKey = "Apple Silicon PMU (Active)"
             #else
             snapshot.activeSMCKey = "Intel BCLM (Active)"
             #endif
         }
 
+        if snapshot.isChargeInhibited {
+            snapshot.isCharging = false
+        }
+
         // 4. Calculate Real-time Battery Wattage
-        if snapshot.isChargeInhibited && snapshot.isACConnected {
+        if snapshot.isChargeInhibited && (snapshot.isACConnected || snapshot.isPhysicalAdapterAttached) {
             // In Sailing Mode (AC Bypass): 0.0 W to battery, laptop powered directly by charger
             snapshot.watts = 0.0
         } else {

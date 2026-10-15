@@ -64,7 +64,6 @@ public final class DashboardViewModel: ObservableObject, @unchecked Sendable {
 
     public func refresh() {
         let snapshot = PowerMonitor.shared.getCurrentSnapshot()
-        SailingManager.shared.evaluatePowerState(snapshot: snapshot)
         updateFromSnapshot(
             status: SailingManager.shared.currentStatus,
             desc: SailingManager.shared.statusDescription,
@@ -187,6 +186,34 @@ public struct DashboardView: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .background(Color.secondary.opacity(0.08))
                 .cornerRadius(6)
+
+            // Helper Permission Alert Banner (if needed)
+            if !HelperManager.shared.isHelperInstalled {
+                HStack(spacing: 8) {
+                    Image(systemName: "exclamationmark.shield.fill")
+                        .foregroundColor(.yellow)
+                        .font(.system(size: 14))
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text("Privileged Helper Required")
+                            .font(.system(size: 10.5, weight: .bold))
+                        Text("Hardware control needs one-time admin approval.")
+                            .font(.system(size: 9))
+                            .foregroundColor(.secondary)
+                    }
+                    Spacer()
+                    Button("Install") {
+                        let bundleHelper = Bundle.main.bundleURL.appendingPathComponent("Contents/Library/LaunchServices/me.batterytoolkit.helper")
+                        HelperManager.shared.installHelperViaAppleScript(bundleHelperURL: bundleHelper) { success, _ in
+                            viewModel.refresh()
+                        }
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.mini)
+                }
+                .padding(7)
+                .background(Color.yellow.opacity(0.12))
+                .cornerRadius(6)
+            }
 
             // 3. Idea 1: Real-time Wattage & Power Flow Telemetry Card
             wattageTelemetryCard

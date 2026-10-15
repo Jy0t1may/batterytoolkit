@@ -53,6 +53,18 @@ public enum SMCKnownKeys {
         inhibitBytes: [0x01],
         chargeBytes: [0x00]
     )
+    public static let CHCC = SMCKeyDefinition(
+        name: "CHCC",
+        size: 1,
+        inhibitBytes: [0x00],
+        chargeBytes: [0x01]
+    )
+    public static let CHCE = SMCKeyDefinition(
+        name: "CHCE",
+        size: 1,
+        inhibitBytes: [0x00],
+        chargeBytes: [0x01]
+    )
     public static let CHTE = SMCKeyDefinition(
         name: "CHTE",
         size: 4,

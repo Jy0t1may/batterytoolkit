@@ -35,6 +35,7 @@ public struct SMCParamStruct {
     public var vers = SMCVersion()
     public var pLimitData = SMCPLimitData()
     public var keyInfo = SMCKeyInfoData()
+    public var padding: UInt16 = 0
     public var result: UInt8 = 0
     public var status: UInt8 = 0
     public var data8: UInt8 = 0
@@ -230,19 +231,29 @@ public final class SMCKit: @unchecked Sendable {
 
     // MARK: - Key Detection
     public func detectSupportedKeys() {
-        let chargeCandidates = [
-            SMCKnownKeys.CH0B,
-            SMCKnownKeys.CH0C,
-            SMCKnownKeys.CHTE,
-            SMCKnownKeys.BCLM
-        ]
+        if PowerUIClient.shared.isSupported {
+            activeChargeKey = SMCKeyDefinition(
+                name: "PowerUI MCL",
+                size: 1,
+                inhibitBytes: [0x55],
+                chargeBytes: [0x64]
+            )
+            os_log("Detected macOS 27 Native PowerUI Manual Charge Limit engine", type: .info)
+        } else {
+            let chargeCandidates = [
+                SMCKnownKeys.CH0C,
+                SMCKnownKeys.CHTE,
+                SMCKnownKeys.CH0B,
+                SMCKnownKeys.BCLM
+            ]
 
-        for candidate in chargeCandidates {
-            if let info = getKeyInfo(candidate.code) {
-                activeChargeKey = candidate
-                os_log("Detected charging SMC key: %{public}@ (size: %{public}d, attr: 0x%{public}x)",
-                       type: .info, candidate.name, info.size, info.attr)
-                break
+            for candidate in chargeCandidates {
+                if let info = getKeyInfo(candidate.code), (info.attr & 0x40) != 0 {
+                    activeChargeKey = candidate
+                    os_log("Detected writable charging SMC key: %{public}@ (size: %{public}d, attr: 0x%{public}x)",
+                           type: .info, candidate.name, info.size, info.attr)
+                    break
+                }
             }
         }
 
@@ -252,7 +263,7 @@ public final class SMCKit: @unchecked Sendable {
         ]
 
         for candidate in adapterCandidates {
-            if let info = getKeyInfo(candidate.code) {
+            if let info = getKeyInfo(candidate.code), (info.attr & 0x40) != 0 {
                 activeAdapterKey = candidate
                 os_log("Detected power adapter SMC key: %{public}@ (size: %{public}d)",
                        type: .info, candidate.name, info.size)
@@ -260,8 +271,8 @@ public final class SMCKit: @unchecked Sendable {
             }
         }
 
-        if getKeyInfo(SMCKnownKeys.MSCS) != nil || getKeyInfo(SMCKnownKeys.MSSN) != nil {
-            magSafeSupported = true
+        if let msInfo = getKeyInfo(SMCKnownKeys.MSCS) ?? getKeyInfo(SMCKnownKeys.MSSN) {
+            magSafeSupported = (msInfo.attr & 0x40) != 0
         }
     }
 
@@ -277,32 +288,67 @@ public final class SMCKit: @unchecked Sendable {
 
     @discardableResult
     public func setChargingInhibited(_ inhibited: Bool) -> Bool {
-        if let key = activeChargeKey {
-            let bytes = inhibited ? key.inhibitBytes : key.chargeBytes
-            let directSuccess = writeBytes(key.code, bytes: bytes)
-            if directSuccess {
-                simulatedInhibit = inhibited
-                return true
-            }
-
-            // Try via privileged helper
-            if let helper = helperConnection.remoteObjectProxyWithErrorHandler({ _ in }) as? BatteryHelperProtocol {
-                helper.setChargingInhibited(inhibited) { [weak self] success in
-                    if success {
-                        self?.simulatedInhibit = inhibited
-                    }
+        // 1. Try native PowerUI MCL first (macOS 26 / 27 Apple Silicon)
+        if PowerUIClient.shared.isSupported {
+            if inhibited {
+                _ = PowerUIClient.shared.setLimit(85)
+                if PowerUIClient.shared.enableMCL() {
+                    simulatedInhibit = true
+                    os_log("Hardware charging inhibited via PowerUI MCL (macOS 27 Native)", type: .info)
+                    return true
+                }
+            } else {
+                _ = PowerUIClient.shared.temporarilyEnableCharging()
+                _ = PowerUIClient.shared.setLimit(100)
+                if PowerUIClient.shared.disableMCL() {
+                    simulatedInhibit = false
+                    os_log("Hardware charging resumed via PowerUI MCL (macOS 27 Native)", type: .info)
+                    return true
                 }
             }
         }
-        // Fallback simulated tracking for safe testing / non-root mode
+
+        // 2. Try direct SMC write if active charge key is writable
+        if let key = activeChargeKey, key.name != "PowerUI MCL" {
+            let bytes = inhibited ? key.inhibitBytes : key.chargeBytes
+            if writeBytes(key.code, bytes: bytes) {
+                simulatedInhibit = inhibited
+                return true
+            }
+        }
+
+        // 3. Try via privileged helper daemon (root launchd service)
+        let helperConn = HelperManager.shared.getHelperConnection()
+        let semaphore = DispatchSemaphore(value: 0)
+        var helperSuccess = false
+
+        if let helper = helperConn.remoteObjectProxyWithErrorHandler({ error in
+            os_log("Helper proxy error: %{public}@", type: .error, error.localizedDescription)
+            semaphore.signal()
+        }) as? BatteryHelperProtocol {
+            helper.setChargingInhibited(inhibited) { success in
+                helperSuccess = success
+                semaphore.signal()
+            }
+            _ = semaphore.wait(timeout: .now() + 1.5)
+            if helperSuccess {
+                simulatedInhibit = inhibited
+                os_log("Hardware charging inhibited via Helper: %{public}@", type: .info, String(inhibited))
+                return true
+            }
+        }
+
         simulatedInhibit = inhibited
-        os_log("Charge inhibit state updated (simulated=%{public}@)",
-               type: .info, String(inhibited))
-        return true
+        os_log("Charge inhibit state updated (simulated=%{public}@, helperSuccess=%{public}@)",
+               type: .info, String(inhibited), String(helperSuccess))
+        return helperSuccess
     }
 
     public func isChargingInhibited() -> Bool {
-        if let key = activeChargeKey, let val = readBytes(key.code, count: key.size) {
+        if PowerUIClient.shared.isSupported {
+            return PowerUIClient.shared.getStatus().enabled
+        }
+        if let key = activeChargeKey, key.name != "PowerUI MCL", let val = readBytes(key.code, count: key.size) {
             return val == key.inhibitBytes
         }
         return simulatedInhibit

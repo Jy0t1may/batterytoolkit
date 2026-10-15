@@ -23,6 +23,7 @@ public final class SailingManager: @unchecked Sendable {
     private let stateLock = NSLock()
 
     public static let stateChangedNotification = NSNotification.Name("BatteryToolkitStateChanged")
+    private var lastHardwareInhibited: Bool? = nil
 
     private init() {
         self.settings = SailingManager.loadSettings()
@@ -121,6 +122,7 @@ public final class SailingManager: @unchecked Sendable {
         stateLock.lock()
         self.currentMode = .fullChargeOnce
         self.isCurrentlySailing = false
+        self.lastHardwareInhibited = nil
         stateLock.unlock()
 
         SMCKit.shared.setChargingInhibited(false)
@@ -134,6 +136,7 @@ public final class SailingManager: @unchecked Sendable {
         stateLock.lock()
         self.currentMode = .manualHold
         self.isCurrentlySailing = false
+        self.lastHardwareInhibited = nil
         stateLock.unlock()
 
         SMCKit.shared.setChargingInhibited(true)
@@ -146,6 +149,7 @@ public final class SailingManager: @unchecked Sendable {
     public func resumeNormalSchedule() {
         stateLock.lock()
         self.currentMode = .sailing
+        self.lastHardwareInhibited = nil
         stateLock.unlock()
 
         let snapshot = PowerMonitor.shared.getCurrentSnapshot()
@@ -161,7 +165,9 @@ public final class SailingManager: @unchecked Sendable {
         let targetLimit = settings.targetLimit
         let resumeThreshold = settings.resumeThreshold
 
-        if !snapshot.isACConnected {
+        let isPluggedIn = snapshot.isACConnected || snapshot.isPhysicalAdapterAttached
+
+        if !isPluggedIn {
             // Running on Battery (unplugged)
             currentStatus = .discharging
             isCurrentlySailing = false
@@ -172,112 +178,97 @@ public final class SailingManager: @unchecked Sendable {
         }
 
         // On AC Charger
+        var desiredInhibit: Bool = false
+        var newStatus: ChargingStatus = .charging
+        var newDescription: String = ""
+        var preventSleep: Bool = false
+
         switch currentMode {
         case .manualHold:
-            SMCKit.shared.setChargingInhibited(true)
-            currentStatus = .paused
-            statusDescription = "Charging Manually Inactive (Holding at \(percent)%)"
-            if settings.magSafeSyncEnabled {
-                SMCKit.shared.setMagSafeLED(state: .orange)
-            }
+            desiredInhibit = true
+            newStatus = .paused
+            newDescription = "Charging Manually Inactive (Holding at \(percent)%)"
 
         case .fullChargeOnce:
             if percent >= 100 {
-                // Reached 100%, return to sailing mode
                 currentMode = .sailing
                 isCurrentlySailing = true
-                SMCKit.shared.setChargingInhibited(true)
-                SleepManager.shared.restoreSleep()
-                currentStatus = .charged
-                statusDescription = "Full Charge Complete (100%). Returning to Sailing Mode."
-                if settings.magSafeSyncEnabled {
-                    SMCKit.shared.setMagSafeLED(state: .green)
-                }
+                desiredInhibit = true
+                newStatus = .charged
+                newDescription = "Full Charge Complete (100%). Returning to Sailing Mode."
             } else {
-                SMCKit.shared.setChargingInhibited(false)
-                SleepManager.shared.disableSleep(reason: "BatteryToolkit: Charging to 100%")
-                currentStatus = .charging
-                statusDescription = "Charging to 100% (\(percent)%)"
-                if settings.magSafeSyncEnabled {
-                    SMCKit.shared.setMagSafeLED(state: .orange)
-                }
+                desiredInhibit = false
+                preventSleep = true
+                newStatus = .charging
+                newDescription = "Charging to 100% (\(percent)%)"
             }
 
         case .directLimit:
             if percent >= targetLimit {
-                SMCKit.shared.setChargingInhibited(true)
-                SleepManager.shared.restoreSleep()
-                currentStatus = .charged
-                statusDescription = "Powered by Adapter (Holding at limit \(targetLimit)%)"
-                if settings.magSafeSyncEnabled {
-                    SMCKit.shared.setMagSafeLED(state: .green)
-                }
+                desiredInhibit = true
+                newStatus = .charged
+                newDescription = "Powered by Adapter (Holding at limit \(targetLimit)%)"
             } else {
-                SMCKit.shared.setChargingInhibited(false)
-                SleepManager.shared.disableSleep(reason: "BatteryToolkit: Charging to Limit")
-                currentStatus = .charging
-                statusDescription = "Charging to \(targetLimit)% (\(percent)%)"
-                if settings.magSafeSyncEnabled {
-                    SMCKit.shared.setMagSafeLED(state: .orange)
-                }
+                desiredInhibit = false
+                preventSleep = true
+                newStatus = .charging
+                newDescription = "Charging to \(targetLimit)% (\(percent)%)"
             }
 
         case .sailing:
             if percent >= targetLimit {
-                // Upper limit reached -> Inhibit charging, enter Sailing Mode!
                 isCurrentlySailing = true
-                SMCKit.shared.setChargingInhibited(true)
-                SleepManager.shared.restoreSleep()
-                currentStatus = .sailing
-                statusDescription = "Powered by Power Adapter (Sailing: \(percent)% ➔ Resumes at \(resumeThreshold)%)"
-                if settings.magSafeSyncEnabled {
-                    SMCKit.shared.setMagSafeLED(state: .green)
-                }
+                desiredInhibit = true
+                newStatus = .sailing
+                newDescription = "Powered by Power Adapter (Sailing: \(percent)% ➔ Resumes at \(resumeThreshold)%)"
             } else if isCurrentlySailing {
-                // Currently Sailing
                 if percent <= resumeThreshold {
-                    // Dropped to or below lower resume threshold -> Re-engage charging!
                     isCurrentlySailing = false
-                    SMCKit.shared.setChargingInhibited(false)
-                    SleepManager.shared.disableSleep(reason: "BatteryToolkit: Sailing Resumed Charging")
-                    currentStatus = .charging
-                    statusDescription = "Charging to \(targetLimit)% (Resumed from \(percent)%)"
-                    if settings.magSafeSyncEnabled {
-                        SMCKit.shared.setMagSafeLED(state: .orange)
-                    }
+                    desiredInhibit = false
+                    preventSleep = true
+                    newStatus = .charging
+                    newDescription = "Charging to \(targetLimit)% (Resumed from \(percent)%)"
                 } else {
-                    // Still Sailing within the buffer zone:
-                    // Mac runs on AC power adapter; battery charge slowly loses power only via natural self-discharge!
-                    SMCKit.shared.setChargingInhibited(true)
-                    SleepManager.shared.restoreSleep()
-                    currentStatus = .sailing
-                    statusDescription = "Powered by Power Adapter (Sailing: \(percent)% ➔ Resumes at \(resumeThreshold)%)"
-                    if settings.magSafeSyncEnabled {
-                        SMCKit.shared.setMagSafeLED(state: .green)
-                    }
+                    desiredInhibit = true
+                    newStatus = .sailing
+                    newDescription = "Powered by Power Adapter (Sailing: \(percent)% ➔ Resumes at \(resumeThreshold)%)"
                 }
             } else {
-                // Not sailing, below targetLimit -> Charge up to target limit
                 if percent < targetLimit {
-                    SMCKit.shared.setChargingInhibited(false)
-                    SleepManager.shared.disableSleep(reason: "BatteryToolkit: Charging to Target Limit")
-                    currentStatus = .charging
-                    statusDescription = "Charging to \(targetLimit)% (\(percent)%)"
-                    if settings.magSafeSyncEnabled {
-                        SMCKit.shared.setMagSafeLED(state: .orange)
-                    }
+                    desiredInhibit = false
+                    preventSleep = true
+                    newStatus = .charging
+                    newDescription = "Charging to \(targetLimit)% (\(percent)%)"
                 } else {
                     isCurrentlySailing = true
-                    SMCKit.shared.setChargingInhibited(true)
-                    SleepManager.shared.restoreSleep()
-                    currentStatus = .sailing
-                    statusDescription = "Powered by Power Adapter (Sailing Active: \(percent)%)"
-                    if settings.magSafeSyncEnabled {
-                        SMCKit.shared.setMagSafeLED(state: .green)
-                    }
+                    desiredInhibit = true
+                    newStatus = .sailing
+                    newDescription = "Powered by Power Adapter (Sailing Active: \(percent)%)"
                 }
             }
         }
+
+        // Apply hardware inhibition ONLY if changed!
+        if lastHardwareInhibited != desiredInhibit {
+            lastHardwareInhibited = desiredInhibit
+            SMCKit.shared.setChargingInhibited(desiredInhibit)
+            if desiredInhibit {
+                SleepManager.shared.restoreSleep()
+                if settings.magSafeSyncEnabled {
+                    SMCKit.shared.setMagSafeLED(state: .green)
+                }
+            } else {
+                if preventSleep {
+                    SleepManager.shared.disableSleep(reason: "BatteryToolkit: Charging")
+                }
+                if settings.magSafeSyncEnabled {
+                    SMCKit.shared.setMagSafeLED(state: .orange)
+                }
+            }
+        }
+
+        currentStatus = newStatus
+        statusDescription = newDescription
 
         os_log("SailingManager: status=%{public}@, sailing=%{public}@, desc=%{public}@",
                type: .info, currentStatus.rawValue, String(isCurrentlySailing), statusDescription)
