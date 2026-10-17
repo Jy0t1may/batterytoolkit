@@ -28,7 +28,7 @@ public final class StatusItemController: NSObject, NSPopoverDelegate, @unchecked
         // Initialize SwiftUI Popover
         let hostingController = NSHostingController(rootView: DashboardView(viewModel: viewModel))
         popover = NSPopover()
-        popover.contentSize = NSSize(width: 340, height: 460)
+        popover.contentSize = NSSize(width: 320, height: 400)
         popover.behavior = .transient
         popover.animates = true
         popover.delegate = self

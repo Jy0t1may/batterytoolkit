@@ -28,6 +28,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // Setup Menu Bar Extra Item
         StatusItemController.shared.setup()
 
+        // Check Privileged Helper status on startup (AlDente Model)
+        HelperManager.shared.checkHelperStatus { isUpToDate in
+            if !isUpToDate {
+                NSLog("BatteryToolkit: Privileged helper not installed or outdated. Prompting user for administrator privileges...")
+                let bundleHelper = Bundle.main.bundleURL.appendingPathComponent("Contents/Library/LaunchServices/me.batterytoolkit.helper")
+                HelperManager.shared.installHelperViaAppleScript(bundleHelperURL: bundleHelper) { success, error in
+                    if success {
+                        NSLog("BatteryToolkit: Privileged helper v%@ installed and verified successfully.", HelperConstants.helperVersion)
+                        DispatchQueue.main.async {
+                            DashboardViewModel.shared.refresh()
+                        }
+                    } else {
+                        NSLog("BatteryToolkit: Privileged helper installation deferred/failed: %@", error ?? "unknown")
+                    }
+                }
+            } else {
+                NSLog("BatteryToolkit: Privileged helper v%@ is active and running.", HelperConstants.helperVersion)
+            }
+        }
+
         NSLog("BatteryToolkit started successfully with Sailing Mode active.")
     }
 

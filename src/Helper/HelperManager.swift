@@ -51,25 +51,87 @@ public final class HelperManager: @unchecked Sendable {
         let conn = getHelperConnection()
         guard let helper = conn.remoteObjectProxyWithErrorHandler({ [weak self] error in
             os_log("Helper connection error: %{public}@", type: .debug, error.localizedDescription)
-            self?.isHelperInstalled = false
+            DispatchQueue.main.async {
+                self?.isHelperInstalled = false
+                self?.helperVersion = nil
+            }
             completion?(false)
         }) as? BatteryHelperProtocol else {
-            self.isHelperInstalled = false
+            DispatchQueue.main.async {
+                self.isHelperInstalled = false
+                self.helperVersion = nil
+            }
             completion?(false)
             return
         }
 
         helper.getVersion { [weak self] version in
-            os_log("Connected to BatteryToolkit Helper v%{public}@", type: .info, version)
-            self?.helperVersion = version
-            self?.isHelperInstalled = true
-            completion?(true)
+            os_log("Connected to BatteryToolkit Helper v%{public}@ (target v%{public}@)",
+                   type: .info, version, HelperConstants.helperVersion)
+            DispatchQueue.main.async {
+                self?.helperVersion = version
+                // Enforce exact version equality like AlDente
+                let matches = (version == HelperConstants.helperVersion)
+                self?.isHelperInstalled = matches
+                completion?(matches)
+            }
         }
     }
 
+    // MARK: - Root Sleep Assertions
+
+    public func createSleepAssertion(reason: String, completion: @escaping (UInt32) -> Void) {
+        let conn = getHelperConnection()
+        guard let helper = conn.remoteObjectProxyWithErrorHandler({ error in
+            os_log("Error requesting sleep assertion from helper: %{public}@", type: .error, error.localizedDescription)
+            completion(0)
+        }) as? BatteryHelperProtocol else {
+            completion(0)
+            return
+        }
+
+        helper.createAssertion(type: "PreventUserIdleSystemSleep", reason: reason) { id in
+            completion(id)
+        }
+    }
+
+    public func releaseSleepAssertion(id: UInt32, completion: ((Bool) -> Void)? = nil) {
+        let conn = getHelperConnection()
+        guard let helper = conn.remoteObjectProxyWithErrorHandler({ error in
+            os_log("Error releasing sleep assertion from helper: %{public}@", type: .error, error.localizedDescription)
+            completion?(false)
+        }) as? BatteryHelperProtocol else {
+            completion?(false)
+            return
+        }
+
+        helper.releaseAssertion(id: id) { success in
+            completion?(success)
+        }
+    }
+
+    // MARK: - Hardware Charging Control
+
+    public func setChargingInhibited(_ inhibited: Bool, limit: Int, completion: @escaping (Bool) -> Void) {
+        let conn = getHelperConnection()
+        guard let helper = conn.remoteObjectProxyWithErrorHandler({ error in
+            os_log("Error sending setChargingInhibited to helper: %{public}@", type: .error, error.localizedDescription)
+            completion(false)
+        }) as? BatteryHelperProtocol else {
+            completion(false)
+            return
+        }
+
+        helper.setChargingInhibited(inhibited, limit: limit) { success in
+            completion(success)
+        }
+    }
+
+    // MARK: - Installation & Privilege Escalation
+
     /// Triggers user authorization to install and register the privileged helper daemon
     public func installHelperViaAppleScript(bundleHelperURL: URL, completion: @escaping (Bool, String?) -> Void) {
-        let helperPath = bundleHelperURL.path
+        let helperPath = bundleHelperURL.standardizedFileURL.path
         let targetHelperDir = "/Library/PrivilegedHelperTools"
         let targetHelperPath = "\(targetHelperDir)/\(HelperConstants.helperID)"
         let plistPath = "/Library/LaunchDaemons/\(HelperConstants.helperID).plist"
@@ -99,8 +161,12 @@ public final class HelperManager: @unchecked Sendable {
         let tmpPlist = "/tmp/\(HelperConstants.helperID).plist"
         try? plistContent.write(toFile: tmpPlist, atomically: true, encoding: .utf8)
 
+        let tmpHelper = "/tmp/\(HelperConstants.helperID).bin"
+        try? FileManager.default.removeItem(atPath: tmpHelper)
+        try? FileManager.default.copyItem(atPath: helperPath, toPath: tmpHelper)
+
         let script = """
-        do shell script "mkdir -p \(targetHelperDir) && cp '\(helperPath)' '\(targetHelperPath)' && chown root:wheel '\(targetHelperPath)' && chmod 755 '\(targetHelperPath)' && cp '\(tmpPlist)' '\(plistPath)' && chown root:wheel '\(plistPath)' && chmod 644 '\(plistPath)' && launchctl unload '\(plistPath)' 2>/dev/null; launchctl load -w '\(plistPath)'" with administrator privileges
+        do shell script "mkdir -p \(targetHelperDir) && cp '\(tmpHelper)' '\(targetHelperPath)' && chown root:wheel '\(targetHelperPath)' && chmod 755 '\(targetHelperPath)' && cp '\(tmpPlist)' '\(plistPath)' && chown root:wheel '\(plistPath)' && chmod 644 '\(plistPath)' && launchctl unload '\(plistPath)' 2>/dev/null; launchctl load -w '\(plistPath)'" with administrator privileges
         """
 
         DispatchQueue.global(qos: .userInitiated).async {
@@ -115,12 +181,16 @@ public final class HelperManager: @unchecked Sendable {
                 }
             }
 
+            // Invalidate current connection so a fresh connection to the new daemon is created
+            self.lock.lock()
+            self.connection?.invalidate()
+            self.connection = nil
+            self.lock.unlock()
+
             // Verify installation
             Thread.sleep(forTimeInterval: 1.0)
-            DispatchQueue.main.async {
-                self.checkHelperStatus { success in
-                    completion(success, nil)
-                }
+            self.checkHelperStatus { success in
+                completion(success, nil)
             }
         }
     }

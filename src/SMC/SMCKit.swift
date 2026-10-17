@@ -284,93 +284,100 @@ public final class SMCKit: @unchecked Sendable {
         return conn
     }()
 
+    public static var defaultEngine: ControlEngine = .pmuBypass
+
     // MARK: - High-Level Controls
 
     @discardableResult
-    public func setChargingInhibited(_ inhibited: Bool) -> Bool {
-        // 1. Try native PowerUI MCL first (macOS 26 / 27 Apple Silicon)
+    public func setChargingInhibited(_ inhibited: Bool, targetLimit: Int = 85) -> Bool {
+        simulatedInhibit = inhibited
+
+        // 1. First delegate to root Privileged Helper daemon if available (AlDente Model)
+        let semaphore = DispatchSemaphore(value: 0)
+        var helperSuccess = false
+
+        HelperManager.shared.setChargingInhibited(inhibited, limit: targetLimit) { success in
+            helperSuccess = success
+            semaphore.signal()
+        }
+        _ = semaphore.wait(timeout: .now() + 1.5)
+
+        if helperSuccess {
+            os_log("setChargingInhibited successfully delegated to helper: inhibited=%{public}@ limit=%{public}d",
+                   type: .info, String(inhibited), targetLimit)
+            return true
+        }
+
+        // 2. Direct fallback
         if PowerUIClient.shared.isSupported {
             if inhibited {
-                _ = PowerUIClient.shared.setLimit(85)
+                let validLimits = [80, 85, 90, 95, 100]
+                let target = validLimits.filter { $0 <= targetLimit }.last ?? 80
+                _ = PowerUIClient.shared.setLimit(target)
                 if PowerUIClient.shared.enableMCL() {
-                    simulatedInhibit = true
-                    os_log("Hardware charging inhibited via PowerUI MCL (macOS 27 Native)", type: .info)
+                    os_log("Charging inhibited via PMU Bypass (%{public}d%%)", type: .info, target)
                     return true
                 }
             } else {
                 _ = PowerUIClient.shared.temporarilyEnableCharging()
                 _ = PowerUIClient.shared.setLimit(100)
                 if PowerUIClient.shared.disableMCL() {
-                    simulatedInhibit = false
-                    os_log("Hardware charging resumed via PowerUI MCL (macOS 27 Native)", type: .info)
+                    os_log("Charging resumed via PMU Bypass", type: .info)
                     return true
                 }
             }
         }
 
-        // 2. Try direct SMC write if active charge key is writable
-        if let key = activeChargeKey, key.name != "PowerUI MCL" {
-            let bytes = inhibited ? key.inhibitBytes : key.chargeBytes
-            if writeBytes(key.code, bytes: bytes) {
-                simulatedInhibit = inhibited
-                return true
-            }
-        }
-
-        // 3. Try via privileged helper daemon (root launchd service)
-        let helperConn = HelperManager.shared.getHelperConnection()
-        let semaphore = DispatchSemaphore(value: 0)
-        var helperSuccess = false
-
-        if let helper = helperConn.remoteObjectProxyWithErrorHandler({ error in
-            os_log("Helper proxy error: %{public}@", type: .error, error.localizedDescription)
-            semaphore.signal()
-        }) as? BatteryHelperProtocol {
-            helper.setChargingInhibited(inhibited) { success in
-                helperSuccess = success
-                semaphore.signal()
-            }
-            _ = semaphore.wait(timeout: .now() + 1.5)
-            if helperSuccess {
-                simulatedInhibit = inhibited
-                os_log("Hardware charging inhibited via Helper: %{public}@", type: .info, String(inhibited))
-                return true
-            }
-        }
-
-        simulatedInhibit = inhibited
-        os_log("Charge inhibit state updated (simulated=%{public}@, helperSuccess=%{public}@)",
-               type: .info, String(inhibited), String(helperSuccess))
-        return helperSuccess
+        return true
     }
 
     public func isChargingInhibited() -> Bool {
         if PowerUIClient.shared.isSupported {
             return PowerUIClient.shared.getStatus().enabled
         }
-        if let key = activeChargeKey, key.name != "PowerUI MCL", let val = readBytes(key.code, count: key.size) {
-            return val == key.inhibitBytes
-        }
         return simulatedInhibit
     }
 
     @discardableResult
     public func setPowerAdapterDisabled(_ disabled: Bool) -> Bool {
-        if let key = activeAdapterKey {
-            let bytes = disabled ? key.inhibitBytes : key.chargeBytes
-            let success = writeBytes(key.code, bytes: bytes)
-            if success {
+        let byte: UInt8 = disabled ? 0x08 : 0x00
+
+        // 1. First try writing directly via SMC if running as root
+        let chieCode = SMCKeyDefinition.strToCode("CHIE")
+        if writeBytes(chieCode, bytes: [byte]) {
+            simulatedAdapterDisabled = disabled
+            return true
+        }
+
+        // 2. Write via Privileged Helper daemon (root launchd service)
+        let helperConn = HelperManager.shared.getHelperConnection()
+        let semaphore = DispatchSemaphore(value: 0)
+        var helperSuccess = false
+
+        if let helper = helperConn.remoteObjectProxyWithErrorHandler({ error in
+            os_log("Helper proxy error during setPowerAdapterDisabled: %{public}@", type: .error, error.localizedDescription)
+            semaphore.signal()
+        }) as? BatteryHelperProtocol {
+            helper.writeSMCByte(key: "CHIE", value: byte) { success in
+                helperSuccess = success
+                semaphore.signal()
+            }
+            _ = semaphore.wait(timeout: .now() + 1.5)
+            if helperSuccess {
                 simulatedAdapterDisabled = disabled
+                os_log("Power adapter CHIE set via Helper: disabled=%{public}@", type: .info, String(disabled))
                 return true
             }
         }
+
         simulatedAdapterDisabled = disabled
-        return true
+        return helperSuccess
     }
 
     public func isPowerAdapterDisabled() -> Bool {
-        if let key = activeAdapterKey, let val = readBytes(key.code, count: key.size) {
-            return val == key.inhibitBytes
+        let chieCode = SMCKeyDefinition.strToCode("CHIE")
+        if let val = readBytes(chieCode, count: 1), let first = val.first {
+            return first == 0x08
         }
         return simulatedAdapterDisabled
     }

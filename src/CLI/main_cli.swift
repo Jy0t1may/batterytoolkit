@@ -22,14 +22,16 @@ struct BatteryToolkitCLI {
 
         Commands:
           status                    Show current battery, power, and sailing status
-          set-limit <50-100>        Set target charge limit (e.g., 85)
-          set-drop <2-30>           Set sailing drop range (e.g., 10 -> resumes at limit-10)
+          set-limit <80-100>        Set target charge limit (discrete steps: 80, 85, 90, 95, 100)
+          set-drop <2-20>           Set sailing drop range (e.g., 5 -> resumes at limit-5)
           sailing-on                Enable Sailing Mode
           sailing-off               Disable Sailing Mode
           charge-full               Charge battery to 100% once
           stop                      Inhibit charging immediately (run on AC power)
           resume                    Resume normal Sailing Mode schedule
           smc-dump                  Inspect hardware SMC keys and attributes
+          test-helper               Check Privileged Helper status and XPC communication
+          install-helper            Install / upgrade Privileged Helper with admin authorization
           test-sailing              Run automated verification test of Sailing Mode hysteresis
           help                      Show this help message
         """)
@@ -66,6 +68,7 @@ struct BatteryToolkitCLI {
             print("  Power Adapter Cut   : \(snapshot.isPowerAdapterDisabled ? "YES" : "NO")")
             print("")
             print("--- Sailing Mode Settings ---")
+            print("  Control Engine      : \(settings.controlEngine.rawValue)")
             print("  Sailing Mode Enabled: \(settings.sailingEnabled ? "YES" : "NO")")
             print("  Target Charge Limit : \(settings.targetLimit)%")
             print("  Sailing Drop Range  : \(settings.sailingDrop)%")
@@ -74,9 +77,9 @@ struct BatteryToolkitCLI {
             print("  Status Description  : \(sailing.statusDescription)")
             print("")
             print("--- Real-Time Wattage & Power Flow ---")
-            if snapshot.isChargeInhibited && snapshot.isACConnected {
+            if abs(snapshot.amperage) <= 60 && snapshot.isACConnected {
                 print("  Battery Power Flow  : 0.0 W (Idle - Mac Powered by AC Adapter)")
-            } else if snapshot.isCharging {
+            } else if snapshot.amperage > 60 {
                 print("  Battery Power Flow  : +\(String(format: "%.2f W", snapshot.watts)) (Charging Inflow)")
             } else {
                 print("  Battery Power Flow  : -\(String(format: "%.2f W", snapshot.watts)) (Discharge Rate)")
@@ -96,8 +99,8 @@ struct BatteryToolkitCLI {
             print("========================================================")
 
         case "set-limit":
-            guard args.count > 2, let limit = Int(args[2]), limit >= 50, limit <= 100 else {
-                print("Error: Limit must be an integer between 50 and 100.")
+            guard args.count > 2, let limit = Int(args[2]), limit >= 80, limit <= 100 else {
+                print("Error: Limit must be an integer between 80 and 100 (supported: 80, 85, 90, 95, 100).")
                 exit(1)
             }
             sailing.setTargetLimit(limit)
@@ -156,6 +159,60 @@ struct BatteryToolkitCLI {
             print("Active Charge Inhibit Key : \(smc.activeChargeKey?.name ?? "Apple Silicon CH0B (Active)")")
             print("Active Adapter Key        : \(smc.activeAdapterKey?.name ?? "Simulated / Fallback")")
             print("MagSafe 3 LED Supported   : \(smc.magSafeSupported ? "YES" : "NO")")
+
+        case "test-helper":
+            printBanner()
+            print("Testing Privileged Helper Daemon (XPC)...")
+            print("  Mach Service : \(HelperConstants.machServiceName)")
+            print("  Expected Ver : v\(HelperConstants.helperVersion)")
+            let sema = DispatchSemaphore(value: 0)
+            let conn = HelperManager.shared.getHelperConnection()
+            guard let helper = conn.remoteObjectProxyWithErrorHandler({ err in
+                print("  Status       : FAILED to connect (\(err.localizedDescription))")
+                sema.signal()
+            }) as? BatteryHelperProtocol else {
+                print("  Status       : FAILED to obtain BatteryHelperProtocol proxy")
+                exit(1)
+            }
+
+            helper.getVersion { ver in
+                print("  Running Ver  : v\(ver)")
+                if ver == HelperConstants.helperVersion {
+                    print("  Version Match: YES (Up to date)")
+                } else {
+                    print("  Version Match: NO (Installed: v\(ver), Required: v\(HelperConstants.helperVersion))")
+                }
+
+                // Test root sleep assertion
+                helper.createAssertion(type: "PreventUserIdleSystemSleep", reason: "CLI Test") { aid in
+                    if aid != 0 {
+                        print("  Assertion Test: SUCCESS (Created root assertion ID: \(aid))")
+                        helper.releaseAssertion(id: aid) { ok in
+                            print("  Assertion Rel : \(ok ? "SUCCESS" : "FAILED")")
+                            sema.signal()
+                        }
+                    } else {
+                        print("  Assertion Test: FAILED")
+                        sema.signal()
+                    }
+                }
+            }
+            _ = sema.wait(timeout: .now() + 3.0)
+
+        case "install-helper":
+            printBanner()
+            let currentDir = FileManager.default.currentDirectoryPath
+            let bundleHelper = URL(fileURLWithPath: currentDir).appendingPathComponent("build/batterytoolkit-helper")
+            let sema = DispatchSemaphore(value: 0)
+            HelperManager.shared.installHelperViaAppleScript(bundleHelperURL: bundleHelper) { success, err in
+                if success {
+                    print("✓ Privileged Helper installed and verified successfully!")
+                } else {
+                    print("✗ Installation failed: \(err ?? "Unknown error")")
+                }
+                sema.signal()
+            }
+            _ = sema.wait(timeout: .now() + 30.0)
 
         case "test-sailing":
             printBanner()
@@ -224,6 +281,7 @@ struct BatteryToolkitCLI {
 
             // 8. Unplug AC adapter (switch to battery power)
             snap.isACConnected = false
+            snap.isPhysicalAdapterAttached = false
             sailing.evaluatePowerState(snapshot: snap)
             assert(sailing.currentStatus == .discharging, "Test 8 Failed: Should be discharging when unplugged")
             print("  [Pass] Charger Unplugged: State = DISCHARGING. Mac running on Battery.")

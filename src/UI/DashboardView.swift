@@ -18,10 +18,10 @@ public final class DashboardViewModel: ObservableObject, @unchecked Sendable {
     @Published public var currentMode: ChargingMode = .sailing
 
     @Published public var targetLimit: Double = 85
-    @Published public var sailingDrop: Double = 10
+    @Published public var sailingDrop: Double = 5
     @Published public var sailingEnabled: Bool = true
 
-    // Telemetry & Wattage
+    // Real-Time Hardware Telemetry
     @Published public var watts: Double = 0.0
     @Published public var systemLoadWatts: Double = 0.0
     @Published public var adapterWatts: Int = 0
@@ -38,17 +38,16 @@ public final class DashboardViewModel: ObservableObject, @unchecked Sendable {
     private var observerUUID: UUID?
 
     public var resumeThreshold: Int {
-        return max(20, Int(targetLimit - sailingDrop))
+        return max(60, Int(targetLimit - sailingDrop))
     }
 
     private init() {
         let settings = SailingManager.shared.settings
-        self.targetLimit = Double(settings.targetLimit)
+        self.targetLimit = Double(max(80, min(100, settings.targetLimit)))
         self.sailingDrop = Double(settings.sailingDrop)
         self.sailingEnabled = settings.sailingEnabled
         self.currentMode = SailingManager.shared.currentMode
 
-        // Register as multicast observer of SailingManager
         self.observerUUID = SailingManager.shared.addObserver { [weak self] status, desc, snapshot in
             self?.updateFromSnapshot(status: status, desc: desc, snapshot: snapshot)
         }
@@ -64,11 +63,7 @@ public final class DashboardViewModel: ObservableObject, @unchecked Sendable {
 
     public func refresh() {
         let snapshot = PowerMonitor.shared.getCurrentSnapshot()
-        updateFromSnapshot(
-            status: SailingManager.shared.currentStatus,
-            desc: SailingManager.shared.statusDescription,
-            snapshot: snapshot
-        )
+        SailingManager.shared.evaluatePowerState(snapshot: snapshot)
     }
 
     private func updateFromSnapshot(status: ChargingStatus, desc: String, snapshot: BatterySnapshot) {
@@ -92,7 +87,10 @@ public final class DashboardViewModel: ObservableObject, @unchecked Sendable {
     }
 
     public func applyTargetLimit(_ value: Double) {
-        let intVal = Int(value)
+        // Enforce discrete supported steps [80, 85, 90, 95, 100]
+        let step: Double = 5.0
+        let snapped = round(value / step) * step
+        let intVal = Int(min(100, max(80, snapped)))
         self.targetLimit = Double(intVal)
         SailingManager.shared.setTargetLimit(intVal)
         showFeedback("Stop limit set to \(intVal)%")
@@ -102,7 +100,7 @@ public final class DashboardViewModel: ObservableObject, @unchecked Sendable {
         let intVal = Int(value)
         self.sailingDrop = Double(intVal)
         SailingManager.shared.setSailingDrop(intVal)
-        showFeedback("Resume threshold set to \(resumeThreshold)%")
+        showFeedback("Resumes at \(resumeThreshold)%")
     }
 
     public func toggleSailingMode(_ enabled: Bool) {
@@ -113,17 +111,17 @@ public final class DashboardViewModel: ObservableObject, @unchecked Sendable {
 
     public func chargeTo100Once() {
         SailingManager.shared.chargeToFullOnce()
-        showFeedback("⚡️ Initiated one-time charge to 100%")
+        showFeedback("⚡️ Charging to 100% Once")
     }
 
     public func stopChargingNow() {
         SailingManager.shared.stopChargingNow()
-        showFeedback("🛑 Charging inhibited - running on AC power")
+        showFeedback("🛑 Inhibit Active (Holding on AC)")
     }
 
     public func resumeNormalSchedule() {
         SailingManager.shared.resumeNormalSchedule()
-        showFeedback("⛵️ Resumed Sailing Mode schedule")
+        showFeedback("⛵️ Resumed Sailing Schedule")
     }
 
     private func showFeedback(_ text: String) {
@@ -142,64 +140,62 @@ public final class DashboardViewModel: ObservableObject, @unchecked Sendable {
 
 public struct DashboardView: View {
     @ObservedObject var viewModel: DashboardViewModel
-    let timer = Timer.publish(every: 1.5, on: .main, in: .common).autoconnect()
+    let timer = Timer.publish(every: 0.5, on: .main, in: .common).autoconnect()
 
     public init(viewModel: DashboardViewModel = .shared) {
         self.viewModel = viewModel
     }
 
     public var body: some View {
-        VStack(alignment: .leading, spacing: 13) {
-            // 1. Header Card (Battery Ring + Status Badge)
-            HStack(alignment: .center, spacing: 14) {
+        VStack(alignment: .leading, spacing: 10) {
+            // 1. Header Card (Battery Ring + App Title + Status Badge)
+            HStack(alignment: .center, spacing: 12) {
                 ZStack {
                     Circle()
-                        .stroke(Color.secondary.opacity(0.18), lineWidth: 6)
-                        .frame(width: 52, height: 52)
+                        .stroke(Color.secondary.opacity(0.18), lineWidth: 5)
+                        .frame(width: 44, height: 44)
                     Circle()
                         .trim(from: 0, to: CGFloat(viewModel.percentage) / 100.0)
-                        .stroke(ringColor, style: StrokeStyle(lineWidth: 6, lineCap: .round))
+                        .stroke(ringColor, style: StrokeStyle(lineWidth: 5, lineCap: .round))
                         .rotationEffect(.degrees(-90))
-                        .frame(width: 52, height: 52)
+                        .frame(width: 44, height: 44)
                         .animation(.spring(response: 0.5, dampingFraction: 0.7), value: viewModel.percentage)
 
                     Text("\(viewModel.percentage)%")
-                        .font(.system(size: 13, weight: .bold, design: .rounded))
+                        .font(.system(size: 12, weight: .bold, design: .rounded))
                 }
 
-                VStack(alignment: .leading, spacing: 4) {
+                VStack(alignment: .leading, spacing: 3) {
                     Text("BatteryToolkit")
-                        .font(.caption)
-                        .fontWeight(.semibold)
-                        .foregroundColor(.secondary)
+                        .font(.system(size: 12, weight: .bold))
+                        .foregroundColor(.primary)
 
                     statusBadgeView
                 }
+                Spacer()
             }
 
             // 2. Status Description Banner
             Text(viewModel.statusDescription)
-                .font(.system(size: 11))
+                .font(.system(size: 10.5))
                 .foregroundColor(.primary)
+                .lineLimit(2)
                 .fixedSize(horizontal: false, vertical: true)
-                .padding(8)
+                .padding(.horizontal, 8)
+                .padding(.vertical, 6)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .background(Color.secondary.opacity(0.08))
                 .cornerRadius(6)
 
-            // Helper Permission Alert Banner (if needed)
+            // Helper Installation Banner (only if needed)
             if !HelperManager.shared.isHelperInstalled {
                 HStack(spacing: 8) {
                     Image(systemName: "exclamationmark.shield.fill")
                         .foregroundColor(.yellow)
-                        .font(.system(size: 14))
-                    VStack(alignment: .leading, spacing: 1) {
-                        Text("Privileged Helper Required")
-                            .font(.system(size: 10.5, weight: .bold))
-                        Text("Hardware control needs one-time admin approval.")
-                            .font(.system(size: 9))
-                            .foregroundColor(.secondary)
-                    }
+                        .font(.system(size: 13))
+                    Text("Privileged Helper required for hardware control.")
+                        .font(.system(size: 9.5))
+                        .foregroundColor(.secondary)
                     Spacer()
                     Button("Install") {
                         let bundleHelper = Bundle.main.bundleURL.appendingPathComponent("Contents/Library/LaunchServices/me.batterytoolkit.helper")
@@ -210,39 +206,37 @@ public struct DashboardView: View {
                     .buttonStyle(.borderedProminent)
                     .controlSize(.mini)
                 }
-                .padding(7)
+                .padding(6)
                 .background(Color.yellow.opacity(0.12))
                 .cornerRadius(6)
             }
 
-            // 3. Idea 1: Real-time Wattage & Power Flow Telemetry Card
+            // 3. Real-time Hardware Wattage & Power Flow Card
             wattageTelemetryCard
-
-            Divider()
 
             // 4. Sailing Mode Toggle Row
             Toggle(isOn: Binding(
                 get: { viewModel.sailingEnabled },
                 set: { viewModel.toggleSailingMode($0) }
             )) {
-                VStack(alignment: .leading, spacing: 2) {
+                VStack(alignment: .leading, spacing: 1) {
                     Text("Sailing Mode")
-                        .font(.system(size: 12.5, weight: .medium))
-                    Text("Prevents micro-cycles by running on AC power")
-                        .font(.system(size: 9.5))
+                        .font(.system(size: 11.5, weight: .semibold))
+                    Text("Runs Mac on AC power; naturally drops before recharge")
+                        .font(.system(size: 9))
                         .foregroundColor(.secondary)
                 }
             }
             .toggleStyle(SwitchToggleStyle())
 
-            // 5. Charge Limit Slider
-            VStack(alignment: .leading, spacing: 3) {
+            // 5. Charge Limit Slider (80% to 100%)
+            VStack(alignment: .leading, spacing: 2) {
                 HStack {
-                    Text("Stop Charging Threshold")
-                        .font(.system(size: 11))
+                    Text("Charge Limit")
+                        .font(.system(size: 10.5, weight: .medium))
                     Spacer()
                     Text("\(Int(viewModel.targetLimit))%")
-                        .font(.system(size: 11.5, weight: .bold))
+                        .font(.system(size: 11, weight: .bold))
                 }
 
                 Slider(
@@ -250,41 +244,36 @@ public struct DashboardView: View {
                         get: { viewModel.targetLimit },
                         set: { viewModel.applyTargetLimit($0) }
                     ),
-                    in: 50...100,
-                    step: 1
+                    in: 80...100,
+                    step: 5
                 )
             }
 
-            // 6. Sailing Drop Slider
-            VStack(alignment: .leading, spacing: 3) {
-                HStack {
-                    Text("Sailing Drop Range")
-                        .font(.system(size: 11))
-                    Spacer()
-                    Text("\(Int(viewModel.sailingDrop))% (Resumes at \(viewModel.resumeThreshold)%)")
-                        .font(.system(size: 11, weight: .semibold))
-                        .foregroundColor(.teal)
+            // 6. Sailing Drop Range Slider (2% to 20%)
+            if viewModel.sailingEnabled {
+                VStack(alignment: .leading, spacing: 2) {
+                    HStack {
+                        Text("Sailing Drop Range")
+                            .font(.system(size: 10.5, weight: .medium))
+                        Spacer()
+                        Text("\(Int(viewModel.sailingDrop))% (Resumes at \(viewModel.resumeThreshold)%)")
+                            .font(.system(size: 10.5, weight: .semibold))
+                            .foregroundColor(.teal)
+                    }
+
+                    Slider(
+                        value: Binding(
+                            get: { viewModel.sailingDrop },
+                            set: { viewModel.applySailingDrop($0) }
+                        ),
+                        in: 2...20,
+                        step: 1
+                    )
                 }
-
-                Slider(
-                    value: Binding(
-                        get: { viewModel.sailingDrop },
-                        set: { viewModel.applySailingDrop($0) }
-                    ),
-                    in: 2...25,
-                    step: 1
-                )
-
-                Text("Stops charging at \(Int(viewModel.targetLimit))%. Mac stays on AC charger. Natural discharge down to \(viewModel.resumeThreshold)% before recharging.")
-                    .font(.system(size: 9.5))
-                    .foregroundColor(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
             }
 
-            Divider()
-
-            // 7. Action Buttons with Spring Animations & Active Mode Highlight (Issue 3)
-            HStack(spacing: 8) {
+            // 7. Action Buttons (Spring Press Animations)
+            HStack(spacing: 6) {
                 actionButton(
                     title: "100% Once",
                     icon: "bolt.fill",
@@ -295,7 +284,7 @@ public struct DashboardView: View {
                 }
 
                 actionButton(
-                    title: "Inhibit (AC)",
+                    title: "Inhibit (Hold)",
                     icon: "pause.fill",
                     isActive: viewModel.currentMode == .manualHold,
                     activeColor: .red
@@ -313,51 +302,39 @@ public struct DashboardView: View {
                 }
             }
 
-            // Optional Animated Action Feedback Toast
+            // Optional Feedback Banner
             if let feedback = viewModel.actionFeedback {
                 HStack {
                     Image(systemName: "checkmark.circle.fill")
                         .foregroundColor(.green)
                     Text(feedback)
-                        .font(.system(size: 10, weight: .medium))
+                        .font(.system(size: 9.5, weight: .medium))
                 }
-                .padding(6)
+                .padding(4)
                 .frame(maxWidth: .infinity)
                 .background(Color.green.opacity(0.12))
-                .cornerRadius(6)
-                .transition(.opacity.combined(with: .scale(scale: 0.95)))
+                .cornerRadius(5)
+                .transition(.opacity)
             }
 
             Divider()
 
-            // 8. Hardware Telemetry Card (Issue 4: Cycle count & SMC keys)
-            VStack(alignment: .leading, spacing: 3) {
-                HStack {
-                    Text("SMC Control: \(viewModel.activeSMCKey)")
-                        .font(.system(size: 9.5, design: .monospaced))
-                        .foregroundColor(.secondary)
-                    Spacer()
-                    Text("Cycles: \(viewModel.cycleCount)")
-                        .font(.system(size: 9.5, weight: .bold, design: .monospaced))
-                        .foregroundColor(.primary)
-                }
-
-                HStack {
-                    Text("Hardware: \(viewModel.architecture) | Temp: \(String(format: "%.1f°C", viewModel.temperature))")
-                        .font(.system(size: 9.5, design: .monospaced))
-                        .foregroundColor(.secondary)
-                    Spacer()
-                    Button("Quit") {
-                        NSApplication.shared.terminate(nil)
-                    }
-                    .buttonStyle(.borderless)
-                    .font(.system(size: 10))
+            // 8. Footer Telemetry & Quit
+            HStack {
+                Text("Cycles: \(viewModel.cycleCount) | \(String(format: "%.1f°C", viewModel.temperature))")
+                    .font(.system(size: 9.5, design: .monospaced))
                     .foregroundColor(.secondary)
+                Spacer()
+                Button("Quit") {
+                    NSApplication.shared.terminate(nil)
                 }
+                .buttonStyle(.borderless)
+                .font(.system(size: 10))
+                .foregroundColor(.secondary)
             }
         }
-        .padding(15)
-        .frame(width: 340)
+        .padding(12)
+        .frame(width: 320)
         .onReceive(timer) { _ in
             viewModel.refresh()
         }
@@ -367,13 +344,13 @@ public struct DashboardView: View {
 
     @ViewBuilder
     private var wattageTelemetryCard: some View {
-        HStack(spacing: 10) {
+        HStack(spacing: 8) {
             VStack(alignment: .leading, spacing: 2) {
                 Text(wattageHeader)
-                    .font(.system(size: 9, weight: .medium))
+                    .font(.system(size: 8.5, weight: .medium))
                     .foregroundColor(.secondary)
                 Text(wattageValue)
-                    .font(.system(size: 13, weight: .bold, design: .rounded))
+                    .font(.system(size: 12, weight: .bold, design: .rounded))
                     .foregroundColor(wattageColor)
             }
 
@@ -381,43 +358,43 @@ public struct DashboardView: View {
 
             VStack(alignment: .trailing, spacing: 2) {
                 Text("System Load")
-                    .font(.system(size: 9, weight: .medium))
+                    .font(.system(size: 8.5, weight: .medium))
                     .foregroundColor(.secondary)
                 Text(String(format: "%.1f W", viewModel.systemLoadWatts))
-                    .font(.system(size: 13, weight: .bold, design: .rounded))
+                    .font(.system(size: 12, weight: .bold, design: .rounded))
                     .foregroundColor(.primary)
             }
 
             if viewModel.adapterWatts > 0 {
                 VStack(alignment: .trailing, spacing: 2) {
                     Text("Charger")
-                        .font(.system(size: 9, weight: .medium))
+                        .font(.system(size: 8.5, weight: .medium))
                         .foregroundColor(.secondary)
                     Text("\(viewModel.adapterWatts)W")
-                        .font(.system(size: 13, weight: .bold, design: .rounded))
+                        .font(.system(size: 12, weight: .bold, design: .rounded))
                         .foregroundColor(.secondary)
                 }
             }
         }
-        .padding(8)
+        .padding(7)
         .background(Color.secondary.opacity(0.06))
         .cornerRadius(6)
     }
 
     private var wattageHeader: String {
-        if viewModel.currentStatus == .sailing {
-            return "Battery Power (Sailing)"
-        } else if viewModel.isCharging {
-            return "Battery Charging Power"
+        if abs(viewModel.amperage) <= 60 {
+            return "Battery Power (AC Bypass)"
+        } else if viewModel.amperage > 60 {
+            return "Battery Inflow (Charging)"
         } else {
-            return "Battery Drain Rate"
+            return "Battery Drain (Discharge)"
         }
     }
 
     private var wattageValue: String {
-        if viewModel.currentStatus == .sailing {
-            return "0.0 W (Idle)"
-        } else if viewModel.isCharging {
+        if abs(viewModel.amperage) <= 60 {
+            return "0.0 W (AC Powered)"
+        } else if viewModel.amperage > 60 {
             return String(format: "+%.1f W", viewModel.watts)
         } else {
             return String(format: "-%.1f W", viewModel.watts)
@@ -425,12 +402,22 @@ public struct DashboardView: View {
     }
 
     private var wattageColor: Color {
-        if viewModel.currentStatus == .sailing {
+        if abs(viewModel.amperage) <= 60 {
             return .teal
-        } else if viewModel.isCharging {
-            return .orange
+        } else if viewModel.amperage > 60 {
+            return .green
         } else {
-            return .blue
+            return .orange
+        }
+    }
+
+    public struct SpringPressButtonStyle: ButtonStyle {
+        public init() {}
+        public func makeBody(configuration: Configuration) -> some View {
+            configuration.label
+                .scaleEffect(configuration.isPressed ? 0.93 : 1.0)
+                .opacity(configuration.isPressed ? 0.8 : 1.0)
+                .animation(.spring(response: 0.22, dampingFraction: 0.65), value: configuration.isPressed)
         }
     }
 
@@ -450,11 +437,12 @@ public struct DashboardView: View {
                 Image(systemName: icon)
                     .font(.system(size: 10, weight: .bold))
                 Text(title)
-                    .font(.system(size: 10.5, weight: isActive ? .bold : .medium))
+                    .font(.system(size: 10, weight: isActive ? .bold : .medium))
             }
-            .padding(.vertical, 5)
+            .padding(.vertical, 6)
+            .padding(.horizontal, 3)
             .frame(maxWidth: .infinity)
-            .background(isActive ? activeColor.opacity(0.2) : Color.secondary.opacity(0.1))
+            .background(isActive ? activeColor.opacity(0.22) : Color.secondary.opacity(0.09))
             .foregroundColor(isActive ? activeColor : .primary)
             .cornerRadius(6)
             .overlay(
@@ -462,7 +450,7 @@ public struct DashboardView: View {
                     .stroke(isActive ? activeColor : Color.clear, lineWidth: 1.2)
             )
         }
-        .buttonStyle(.plain)
+        .buttonStyle(SpringPressButtonStyle())
     }
 
     private var ringColor: Color {
@@ -496,11 +484,11 @@ public struct DashboardView: View {
 
     private func badge(text: String, color: Color) -> some View {
         Text(text)
-            .font(.system(size: 11, weight: .semibold))
+            .font(.system(size: 10, weight: .semibold))
             .foregroundColor(color)
-            .padding(.horizontal, 8)
-            .padding(.vertical, 3)
+            .padding(.horizontal, 6)
+            .padding(.vertical, 2)
             .background(color.opacity(0.18))
-            .cornerRadius(5)
+            .cornerRadius(4)
     }
 }

@@ -24,6 +24,8 @@ public final class SailingManager: @unchecked Sendable {
 
     public static let stateChangedNotification = NSNotification.Name("BatteryToolkitStateChanged")
     private var lastHardwareInhibited: Bool? = nil
+    private var lastHardwareLimit: Int? = nil
+    private var lastInhibitChangeTime: Date = Date.distantPast
 
     private init() {
         self.settings = SailingManager.loadSettings()
@@ -47,7 +49,6 @@ public final class SailingManager: @unchecked Sendable {
         observers[id] = listener
         observerLock.unlock()
 
-        // Send current snapshot immediately
         let snapshot = PowerMonitor.shared.getCurrentSnapshot()
         listener(currentStatus, statusDescription, snapshot)
         return id
@@ -87,7 +88,7 @@ public final class SailingManager: @unchecked Sendable {
 
     public func setTargetLimit(_ limit: Int) {
         stateLock.lock()
-        self.settings.targetLimit = min(100, max(50, limit))
+        self.settings.targetLimit = min(100, max(80, limit))
         SailingManager.saveSettings(self.settings)
         stateLock.unlock()
 
@@ -97,7 +98,7 @@ public final class SailingManager: @unchecked Sendable {
 
     public func setSailingDrop(_ drop: Int) {
         stateLock.lock()
-        self.settings.sailingDrop = min(30, max(2, drop))
+        self.settings.sailingDrop = min(20, max(2, drop))
         SailingManager.saveSettings(self.settings)
         stateLock.unlock()
 
@@ -123,9 +124,10 @@ public final class SailingManager: @unchecked Sendable {
         self.currentMode = .fullChargeOnce
         self.isCurrentlySailing = false
         self.lastHardwareInhibited = nil
+        self.lastHardwareLimit = nil
         stateLock.unlock()
 
-        SMCKit.shared.setChargingInhibited(false)
+        SMCKit.shared.setChargingInhibited(false, targetLimit: 100)
         SleepManager.shared.disableSleep(reason: "BatteryToolkit: Charging to 100%")
 
         let snapshot = PowerMonitor.shared.getCurrentSnapshot()
@@ -133,16 +135,18 @@ public final class SailingManager: @unchecked Sendable {
     }
 
     public func stopChargingNow() {
+        let snapshot = PowerMonitor.shared.getCurrentSnapshot()
         stateLock.lock()
         self.currentMode = .manualHold
         self.isCurrentlySailing = false
         self.lastHardwareInhibited = nil
+        self.lastHardwareLimit = nil
+        let limitToHold = self.settings.targetLimit
         stateLock.unlock()
 
-        SMCKit.shared.setChargingInhibited(true)
+        SMCKit.shared.setChargingInhibited(true, targetLimit: limitToHold)
         SleepManager.shared.restoreSleep()
 
-        let snapshot = PowerMonitor.shared.getCurrentSnapshot()
         evaluatePowerState(snapshot: snapshot)
     }
 
@@ -150,6 +154,7 @@ public final class SailingManager: @unchecked Sendable {
         stateLock.lock()
         self.currentMode = .sailing
         self.lastHardwareInhibited = nil
+        self.lastHardwareLimit = nil
         stateLock.unlock()
 
         let snapshot = PowerMonitor.shared.getCurrentSnapshot()
@@ -168,7 +173,6 @@ public final class SailingManager: @unchecked Sendable {
         let isPluggedIn = snapshot.isACConnected || snapshot.isPhysicalAdapterAttached
 
         if !isPluggedIn {
-            // Running on Battery (unplugged)
             currentStatus = .discharging
             isCurrentlySailing = false
             statusDescription = "Running on Battery (\(percent)%)"
@@ -177,8 +181,8 @@ public final class SailingManager: @unchecked Sendable {
             return
         }
 
-        // On AC Charger
         var desiredInhibit: Bool = false
+        var hardwareLimit: Int = targetLimit
         var newStatus: ChargingStatus = .charging
         var newDescription: String = ""
         var preventSleep: Bool = false
@@ -186,18 +190,27 @@ public final class SailingManager: @unchecked Sendable {
         switch currentMode {
         case .manualHold:
             desiredInhibit = true
+            hardwareLimit = targetLimit
             newStatus = .paused
-            newDescription = "Charging Manually Inactive (Holding at \(percent)%)"
+            if abs(snapshot.amperage) <= 60 {
+                newDescription = "Inhibit Active (Powered by AC Adapter)"
+            } else if snapshot.amperage < -60 {
+                newDescription = "Inhibit Active (Discharging to \(targetLimit)%)"
+            } else {
+                newDescription = "Inhibit Active (Holding at \(percent)%)"
+            }
 
         case .fullChargeOnce:
             if percent >= 100 {
                 currentMode = .sailing
                 isCurrentlySailing = true
                 desiredInhibit = true
+                hardwareLimit = 100
                 newStatus = .charged
                 newDescription = "Full Charge Complete (100%). Returning to Sailing Mode."
             } else {
                 desiredInhibit = false
+                hardwareLimit = 100
                 preventSleep = true
                 newStatus = .charging
                 newDescription = "Charging to 100% (\(percent)%)"
@@ -206,10 +219,12 @@ public final class SailingManager: @unchecked Sendable {
         case .directLimit:
             if percent >= targetLimit {
                 desiredInhibit = true
+                hardwareLimit = targetLimit
                 newStatus = .charged
                 newDescription = "Powered by Adapter (Holding at limit \(targetLimit)%)"
             } else {
                 desiredInhibit = false
+                hardwareLimit = targetLimit
                 preventSleep = true
                 newStatus = .charging
                 newDescription = "Charging to \(targetLimit)% (\(percent)%)"
@@ -219,39 +234,69 @@ public final class SailingManager: @unchecked Sendable {
             if percent >= targetLimit {
                 isCurrentlySailing = true
                 desiredInhibit = true
+                hardwareLimit = targetLimit
                 newStatus = .sailing
-                newDescription = "Powered by Power Adapter (Sailing: \(percent)% ➔ Resumes at \(resumeThreshold)%)"
+                if abs(snapshot.amperage) <= 60 {
+                    newDescription = "Powered by Adapter (AC Bypass: \(percent)%)"
+                } else if snapshot.amperage < -60 {
+                    newDescription = "Discharging to \(targetLimit)% on AC Adapter (\(percent)%)"
+                } else {
+                    newDescription = "Holding at \(targetLimit)% (\(percent)%)"
+                }
             } else if isCurrentlySailing {
                 if percent <= resumeThreshold {
                     isCurrentlySailing = false
                     desiredInhibit = false
+                    hardwareLimit = targetLimit
                     preventSleep = true
                     newStatus = .charging
-                    newDescription = "Charging to \(targetLimit)% (Resumed from \(percent)%)"
+                    newDescription = "Charging to \(targetLimit)% (Resumed at \(percent)%)"
                 } else {
                     desiredInhibit = true
+                    hardwareLimit = targetLimit
                     newStatus = .sailing
-                    newDescription = "Powered by Power Adapter (Sailing: \(percent)% ➔ Resumes at \(resumeThreshold)%)"
+                    if abs(snapshot.amperage) <= 60 {
+                        newDescription = "Powered by Adapter (Sailing: \(percent)% ➔ Resumes at \(resumeThreshold)%)"
+                    } else if snapshot.amperage < -60 {
+                        newDescription = "Natural Drift: \(percent)% ➔ Resumes at \(resumeThreshold)%"
+                    } else {
+                        newDescription = "Powered by Adapter (Sailing: \(percent)%)"
+                    }
                 }
             } else {
                 if percent < targetLimit {
                     desiredInhibit = false
+                    hardwareLimit = targetLimit
                     preventSleep = true
                     newStatus = .charging
                     newDescription = "Charging to \(targetLimit)% (\(percent)%)"
                 } else {
                     isCurrentlySailing = true
                     desiredInhibit = true
+                    hardwareLimit = targetLimit
                     newStatus = .sailing
-                    newDescription = "Powered by Power Adapter (Sailing Active: \(percent)%)"
+                    newDescription = "Powered by Adapter (Holding at \(percent)%)"
                 }
             }
         }
 
-        // Apply hardware inhibition ONLY if changed!
-        if lastHardwareInhibited != desiredInhibit {
+        // Apply hardware inhibition on state transitions or periodic check (min 4s rate-limited)
+        let currentHardwareInhibit = SMCKit.shared.isChargingInhibited()
+        let now = Date()
+        let shouldApply: Bool
+        if lastHardwareInhibited != desiredInhibit || lastHardwareLimit != hardwareLimit {
+            shouldApply = true
+        } else if currentHardwareInhibit != desiredInhibit && now.timeIntervalSince(lastInhibitChangeTime) > 4.0 {
+            shouldApply = true
+        } else {
+            shouldApply = false
+        }
+
+        if shouldApply {
             lastHardwareInhibited = desiredInhibit
-            SMCKit.shared.setChargingInhibited(desiredInhibit)
+            lastHardwareLimit = hardwareLimit
+            lastInhibitChangeTime = now
+            SMCKit.shared.setChargingInhibited(desiredInhibit, targetLimit: hardwareLimit)
             if desiredInhibit {
                 SleepManager.shared.restoreSleep()
                 if settings.magSafeSyncEnabled {

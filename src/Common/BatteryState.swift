@@ -91,6 +91,11 @@ public struct BatterySnapshot: Codable, Sendable {
     }
 }
 
+public enum ControlEngine: String, Codable, Sendable, CaseIterable {
+    case hardwareAdapter = "Hardware Adapter Cut (Independent SMC)"
+    case pmuBypass = "AC Charger Bypass (Desktop Mode)"
+}
+
 public struct SailingSettings: Codable, Sendable {
     public var targetLimit: Int
     public var sailingDrop: Int
@@ -98,25 +103,28 @@ public struct SailingSettings: Codable, Sendable {
     public var adapterSleepEnabled: Bool
     public var magSafeSyncEnabled: Bool
     public var launchAtLogin: Bool
+    public var controlEngine: ControlEngine
 
     public var resumeThreshold: Int {
-        return max(20, targetLimit - sailingDrop)
+        return max(60, targetLimit - sailingDrop)
     }
 
     public init(
         targetLimit: Int = 85,
-        sailingDrop: Int = 10,
+        sailingDrop: Int = 5,
         sailingEnabled: Bool = true,
         adapterSleepEnabled: Bool = false,
         magSafeSyncEnabled: Bool = true,
-        launchAtLogin: Bool = true
+        launchAtLogin: Bool = true,
+        controlEngine: ControlEngine = .pmuBypass
     ) {
-        self.targetLimit = targetLimit
+        self.targetLimit = min(100, max(80, targetLimit))
         self.sailingDrop = sailingDrop
         self.sailingEnabled = sailingEnabled
         self.adapterSleepEnabled = adapterSleepEnabled
         self.magSafeSyncEnabled = magSafeSyncEnabled
         self.launchAtLogin = launchAtLogin
+        self.controlEngine = .pmuBypass
     }
 
     public static let `default` = SailingSettings()

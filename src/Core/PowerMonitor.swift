@@ -18,6 +18,7 @@ public final class PowerMonitor: @unchecked Sendable {
 
     private var powerToken: Int32 = 0
     private var percentToken: Int32 = 0
+    private var pollTimer: DispatchSourceTimer?
     private var isListening = false
     private let lock = NSLock()
 
@@ -56,6 +57,15 @@ public final class PowerMonitor: @unchecked Sendable {
             self?.handlePowerChange()
         }
 
+        // High-frequency 500ms (2Hz) timer for responsive real-time wattage & system load
+        let timer = DispatchSource.makeTimerSource(queue: DispatchQueue.main)
+        timer.schedule(deadline: .now() + 0.5, repeating: 0.5)
+        timer.setEventHandler { [weak self] in
+            self?.handlePowerChange()
+        }
+        timer.resume()
+        self.pollTimer = timer
+
         isListening = true
         handlePowerChange()
     }
@@ -67,6 +77,8 @@ public final class PowerMonitor: @unchecked Sendable {
         guard isListening else { return }
         notify_cancel(powerToken)
         notify_cancel(percentToken)
+        pollTimer?.cancel()
+        pollTimer = nil
         isListening = false
     }
 
@@ -123,25 +135,51 @@ public final class PowerMonitor: @unchecked Sendable {
             var props: Unmanaged<CFMutableDictionary>?
             let kr = IORegistryEntryCreateCFProperties(smartBatteryService, &props, kCFAllocatorDefault, 0)
             if kr == KERN_SUCCESS, let dict = props?.takeRetainedValue() as? [String: Any] {
-                // Physical Adapter Connection
-                if let rawExt = dict["AppleRawExternalConnected"] as? Bool {
-                    snapshot.isPhysicalAdapterAttached = rawExt
-                } else if let ext = dict["ExternalConnected"] as? Bool {
-                    snapshot.isPhysicalAdapterAttached = ext
+                // Physical Adapter Connection Check
+                var ioregConnected = false
+                if let ext = dict["ExternalConnected"] as? Bool {
+                    ioregConnected = ext
+                } else if let extInt = dict["ExternalConnected"] as? Int {
+                    ioregConnected = (extInt != 0)
+                }
+
+                if !ioregConnected {
+                    if let rawExt = dict["AppleRawExternalConnected"] as? Bool {
+                        ioregConnected = rawExt
+                    } else if let rawExtInt = dict["AppleRawExternalConnected"] as? Int {
+                        ioregConnected = (rawExtInt != 0)
+                    }
+                }
+
+                if ioregConnected {
+                    if let adapterDetails = dict["AdapterDetails"] as? [String: Any],
+                       let watts = adapterDetails["Watts"] as? Int {
+                        snapshot.adapterWatts = watts
+                    }
                 } else {
-                    snapshot.isPhysicalAdapterAttached = snapshot.isACConnected
+                    snapshot.adapterWatts = 0
                 }
 
-                // Hardware NotCharging Reason
-                if let notChargingReason = dict["NotChargingReason"] as? Int, notChargingReason != 0 {
-                    snapshot.isChargeInhibited = true
-                }
+                let isPluggedIn = snapshot.isACConnected || ioregConnected
+                snapshot.isACConnected = isPluggedIn
+                snapshot.isPhysicalAdapterAttached = isPluggedIn
 
-                // Hardware IsCharging Flag
-                if let hwCharging = dict["IsCharging"] as? Bool {
-                    snapshot.isCharging = hwCharging
-                } else if let hwChargingInt = dict["IsCharging"] as? Int {
-                    snapshot.isCharging = (hwChargingInt != 0)
+                if !isPluggedIn {
+                    snapshot.isCharging = false
+                    snapshot.isChargeInhibited = false
+                    snapshot.adapterWatts = 0
+                } else {
+                    // Hardware NotCharging Reason
+                    if let notChargingReason = dict["NotChargingReason"] as? Int, notChargingReason != 0 {
+                        snapshot.isChargeInhibited = true
+                    }
+
+                    // Hardware IsCharging Flag
+                    if let hwCharging = dict["IsCharging"] as? Bool {
+                        snapshot.isCharging = hwCharging
+                    } else if let hwChargingInt = dict["IsCharging"] as? Int {
+                        snapshot.isCharging = (hwChargingInt != 0)
+                    }
                 }
 
                 // Exact hardware cycle count
@@ -171,7 +209,8 @@ public final class PowerMonitor: @unchecked Sendable {
                 }
 
                 // Adapter Wattage
-                if let adapterDetails = dict["AdapterDetails"] as? [String: Any],
+                if snapshot.adapterWatts == 0,
+                   let adapterDetails = dict["AdapterDetails"] as? [String: Any],
                    let watts = adapterDetails["Watts"] as? Int {
                     snapshot.adapterWatts = watts
                 }
@@ -187,36 +226,25 @@ public final class PowerMonitor: @unchecked Sendable {
             }
         }
 
-        // 3. SMC State and Dynamic Key Description
-        let smcInhibit = SMCKit.shared.isChargingInhibited()
-        snapshot.isChargeInhibited = snapshot.isChargeInhibited || smcInhibit
+        // 3. Hardware State & PMU Description
         snapshot.isPowerAdapterDisabled = SMCKit.shared.isPowerAdapterDisabled()
+        snapshot.activeSMCKey = "Apple Silicon PMU Bypass"
 
-        if PowerUIClient.shared.isSupported {
-            snapshot.activeSMCKey = "PowerUI MCL (macOS 27 Native)"
-            if PowerUIClient.shared.getStatus().enabled {
-                snapshot.isChargeInhibited = true
-            }
-        } else if let key = SMCKit.shared.activeChargeKey {
-            snapshot.activeSMCKey = "\(key.name) (Active)"
-        } else {
-            #if arch(arm64)
-            snapshot.activeSMCKey = "Apple Silicon PMU (Active)"
-            #else
-            snapshot.activeSMCKey = "Intel BCLM (Active)"
-            #endif
-        }
-
-        if snapshot.isChargeInhibited {
+        let smcInhibit = SMCKit.shared.isChargingInhibited()
+        if smcInhibit {
+            snapshot.isChargeInhibited = true
             snapshot.isCharging = false
         }
 
-        // 4. Calculate Real-time Battery Wattage
-        if snapshot.isChargeInhibited && (snapshot.isACConnected || snapshot.isPhysicalAdapterAttached) {
-            // In Sailing Mode (AC Bypass): 0.0 W to battery, laptop powered directly by charger
+        // 4. Calculate Real-time Hardware Battery Wattage
+        let liveAmperage = snapshot.amperage
+        let liveVoltage = snapshot.voltage
+
+        if abs(liveAmperage) <= 60 {
+            // Under 60 mA is negligible idle current / true AC bypass
             snapshot.watts = 0.0
         } else {
-            snapshot.watts = (snapshot.voltage * Double(abs(snapshot.amperage))) / 1000.0
+            snapshot.watts = (liveVoltage * Double(abs(liveAmperage))) / 1000.0
         }
 
         if snapshot.systemLoadWatts == 0.0 {
